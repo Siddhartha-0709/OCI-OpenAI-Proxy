@@ -1,0 +1,15 @@
+{
+  "name": "oci-genai-openai-proxy",
+  "version": "1.0.0",
+  "description": "Translates OpenAI Chat Completions calls (from n8n) into OCI Generative AI Responses API calls, so n8n's AI Agent node can use real tool/function calling against OCI models like google.gemini-2.5-flash.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
