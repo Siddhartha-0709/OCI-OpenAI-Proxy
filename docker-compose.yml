@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  oci-openai-proxy:
+    image: siddhartha0709/oci-openai-proxy
+    container_name: oci-openai-proxy
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
