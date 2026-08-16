@@ -15,63 +15,125 @@
  *   http://localhost:3000/v1
  * API Key field in n8n can be any placeholder string - this proxy injects the
  * real OCI Authorization + OpenAI-Project headers itself, server-side.
+ *
+ * FIXES IN THIS VERSION:
+ * 1. sanitizeSchemaForGemini() - strips $schema/additionalProperties/etc and
+ *    coerces array-valued "type" (e.g. ["string","number","boolean"]) down to
+ *    a single type, since Gemini's function-calling schema only supports a
+ *    narrow JSON-Schema subset and rejects unknown keys / union types.
+ * 2. Empty-content guard on the plain message branch - some backends
+ *    (confirmed on OpenAI-hosted GPT-OSS-120B via OCI) reject any input item
+ *    with content === "" ("Message content cannot be empty"), where Gemini
+ *    silently tolerated it. We now skip pushing empty-content items instead
+ *    of forwarding them.
+ * 3. Same empty-content guard applied to function_call_output (tool result)
+ *    content, and to the assistant tool_calls branch's trailing content push.
  */
 
 const express = require('express');
 const { randomUUID } = require('crypto');
-
+require('dotenv').config();
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 
 // ---------------------------------------------------------------------------
 // Config - set these via environment variables, do NOT hardcode secrets
 // ---------------------------------------------------------------------------
-const OCI_BASE_URL = 'https://inference.generativeai.ap-hyderabad-1.oci.oraclecloud.com/openai/v1';
-const OCI_API_KEY = 'sk-qH51ybulromeKpLjSdQlOl78NqZMDg9opDSLX7BaCi7wAZn4';
-const OCI_PROJECT_ID = 'ocid1.generativeaiproject.oc1.ap-hyderabad-1.amaaaaaayzl4usya54fovoscdd5ekgsc5smies4rmqtv6d2ed66mis3bzjuq'; // ocid1.generativeaiproject...
-const PORT = process.env.PORT || 8888;
+const OCI_BASE_URL = process.env.OCI_BASE_URL;
+const OCI_API_KEY = process.env.OCI_API_KEY;
+const OCI_PROJECT_ID = process.env.OCI_PROJECT_ID;
+const PORT = process.env.PORT;
 
-if (!OCI_API_KEY || !OCI_PROJECT_ID) {
+
+if (!OCI_API_KEY || !OCI_PROJECT_ID || !OCI_BASE_URL || !PORT) {
   console.error(
-    'FATAL: OCI_GENAI_API_KEY and OCI_GENAI_PROJECT_ID env vars are required.'
+    'FATAL: One or more required environment variables are missing.'
   );
   process.exit(1);
 }
-
-// ---------------------------------------------------------------------------
-// Helpers: translate Chat Completions request -> Responses API request
-// ---------------------------------------------------------------------------
-
-/**
- * Chat Completions `messages[]` roughly maps 1:1 onto Responses `input[]`.
- * Chat Completions `tools[].function.{name,description,parameters}` needs to be
- * flattened to Responses `tools[].{type:'function', name, description, parameters}`.
- */
 
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.originalUrl}`);
   next();
 });
 
-
+// ---------------------------------------------------------------------------
+// Helper: is this content value "empty" in a way that will get an input item
+// rejected by strict backends (GPT-OSS via OCI rejects content === "")?
+// ---------------------------------------------------------------------------
+function isEmptyContent(value) {
+  if (value == null) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
 
 // ---------------------------------------------------------------------------
-// Helpers: translate Responses API result -> Chat Completions result
+// Helper: sanitize a JSON Schema object so it validates against Gemini's
+// function-calling tool schema (a restricted JSON-Schema subset). Strips
+// unsupported keywords ($schema, additionalProperties, default, minimum,
+// maximum, etc.) and coerces array-valued "type" down to a single string
+// type (Gemini has no concept of a union type).
 // ---------------------------------------------------------------------------
+const ALLOWED_SCHEMA_KEYS = new Set([
+  'type', 'description', 'enum', 'items', 'properties', 'required',
+  'format', 'nullable',
+]);
 
+function sanitizeSchemaForGemini(schema) {
+  if (schema === null || typeof schema !== 'object') return schema;
+
+  if (Array.isArray(schema)) {
+    return schema.map(sanitizeSchemaForGemini);
+  }
+
+  const out = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (!ALLOWED_SCHEMA_KEYS.has(key)) continue; // drop $schema, additionalProperties, default, minimum, etc.
+
+    if (key === 'type') {
+      if (Array.isArray(value)) {
+        const nonNull = value.filter((t) => t !== 'null');
+        out.type = nonNull[0] || value[0] || 'string';
+        if (value.includes('null')) out.nullable = true;
+      } else {
+        out.type = value;
+      }
+      continue;
+    }
+
+    if (key === 'properties' && value && typeof value === 'object') {
+      const cleanedProps = {};
+      for (const [propName, propSchema] of Object.entries(value)) {
+        cleanedProps[propName] = sanitizeSchemaForGemini(propSchema);
+      }
+      out.properties = cleanedProps;
+      continue;
+    }
+
+    if (key === 'items') {
+      out.items = sanitizeSchemaForGemini(value);
+      continue;
+    }
+
+    out[key] = value;
+  }
+
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: translate Chat Completions request -> Responses API request
+// ---------------------------------------------------------------------------
 
 // Convert a Chat Completions content value (string OR array-of-parts)
 // into the shape the Responses API expects for a given role.
 function toResponsesContent(content, role) {
   if (content == null) return content;
 
-  // Plain string content is valid as-is for both APIs.
   if (typeof content === 'string') return content;
 
-  // Array of content parts: translate Chat Completions part types
-  // ("text", "image_url", "input_audio", ...) into Responses part types
-  // ("input_text"/"output_text", "input_image", ...).
   if (Array.isArray(content)) {
     const textType = role === 'assistant' ? 'output_text' : 'input_text';
     return content.map((part) => {
@@ -86,14 +148,13 @@ function toResponsesContent(content, role) {
             : part.image_url?.url,
         };
       }
-      // Pass through anything already in Responses-native shape
-      // (e.g. someone already sent input_text/input_image/output_text).
       return part;
     });
   }
 
   return content;
 }
+
 function chatCompletionsToResponses(body) {
   const {
     model,
@@ -109,13 +170,18 @@ function chatCompletionsToResponses(body) {
   const input = [];
   for (const msg of messages) {
     if (msg.role === 'tool') {
+      const rawOutput =
+        typeof msg.content === 'string'
+          ? msg.content
+          : JSON.stringify(msg.content);
+      // Guard against an empty tool result string - some backends reject
+      // empty content anywhere in input, including function_call_output.
+      const output = isEmptyContent(rawOutput) ? '(no output)' : rawOutput;
+
       input.push({
         type: 'function_call_output',
         call_id: msg.tool_call_id,
-        output:
-          typeof msg.content === 'string'
-            ? msg.content
-            : JSON.stringify(msg.content),
+        output,
       });
     } else if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
@@ -126,21 +192,27 @@ function chatCompletionsToResponses(body) {
           arguments: tc.function.arguments,
         });
       }
-      if (msg.content) {
+      // Only attach a trailing assistant content item if there's real
+      // (non-empty) content - an assistant turn that's pure tool_calls
+      // should not also push a { role: 'assistant', content: '' } item.
+      if (!isEmptyContent(msg.content)) {
         input.push({
           role: 'assistant',
           content: toResponsesContent(msg.content, 'assistant'),
         });
       }
     } else {
-      input.push({
-        role: msg.role,
-        content: toResponsesContent(msg.content, msg.role),
-      });
+      const converted = toResponsesContent(msg.content, msg.role);
+      // Skip pushing messages with empty content entirely rather than
+      // forwarding { role, content: "" } / { role, content: [] }, which
+      // GPT-OSS-120B (and possibly other OCI-hosted models) reject with
+      // "Message content cannot be empty".
+      if (!isEmptyContent(converted)) {
+        input.push({ role: msg.role, content: converted });
+      }
     }
   }
 
-  // --- this part was missing entirely ---
   const responsesReq = {
     model,
     input,
@@ -156,7 +228,7 @@ function chatCompletionsToResponses(body) {
       type: 'function',
       name: t.function.name,
       description: t.function.description,
-      parameters: t.function.parameters,
+      parameters: sanitizeSchemaForGemini(t.function.parameters),
     }));
   }
 
@@ -172,7 +244,6 @@ function chatCompletionsToResponses(body) {
   }
 
   return responsesReq;
-  // --- end missing part ---
 }
 
 function responsesOutputToChatMessage(output = []) {
@@ -227,8 +298,6 @@ function responsesResultToChatCompletion(result) {
         total_tokens: result.usage.total_tokens,
       }
       : undefined,
-    // Non-standard field, harmless to pass through: lets a follow-up call
-    // resume the same OCI conversation if the caller wants multi-turn state.
     _oci_response_id: result.id,
   };
 }
@@ -245,12 +314,8 @@ async function streamResponsesToChatCompletions(ociResponse, res, model) {
   const chatId = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
 
-  // Track tool_call index -> whether we've already sent the "opening" delta
-  // (id/type/function.name) for that call_id, so subsequent argument deltas
-  // only send the incremental arguments string, matching OpenAI's wire format.
   const toolCallIndexByCallId = new Map();
   let nextToolCallIndex = 0;
-  let sentAnyTextDelta = false;
 
   function sendChunk(delta, finish_reason = null) {
     const chunk = {
@@ -273,12 +338,11 @@ async function streamResponsesToChatCompletions(ociResponse, res, model) {
     try {
       evt = JSON.parse(jsonStr);
     } catch {
-      return; // ignore malformed partial event
+      return;
     }
 
     switch (evt.type) {
       case 'response.output_text.delta': {
-        sentAnyTextDelta = true;
         sendChunk({ content: evt.delta });
         break;
       }
@@ -322,15 +386,10 @@ async function streamResponsesToChatCompletions(ociResponse, res, model) {
       }
 
       default:
-        // response.created, response.in_progress, response.output_item.done,
-        // response.function_call_arguments.done - no Chat Completions equivalent needed
         break;
     }
   }
 
-  // Node's built-in fetch() returns a Web Streams `ReadableStream` for
-  // response.body (not a Node.js EventEmitter stream), so we must read it
-  // via getReader() rather than .on('data', ...).
   const reader = ociResponse.body.getReader();
   const decoder = new TextDecoder('utf-8');
   let buffer = '';
@@ -342,11 +401,10 @@ async function streamResponsesToChatCompletions(ociResponse, res, model) {
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep last partial line for next chunk
+      buffer = lines.pop();
 
       for (const line of lines) processLine(line);
     }
-    // flush any trailing partial line
     if (buffer) processLine(buffer);
   } catch (err) {
     console.error('OCI stream read error:', err);
@@ -366,12 +424,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const responsesReq = chatCompletionsToResponses(req.body);
 
-
     // TEMP DEBUG — remove once fixed
     console.log('--- Outgoing to OCI ---');
     console.log(JSON.stringify(responsesReq, null, 2));
     console.log('-----------------------');
-
 
     const ociRes = await fetch(`${OCI_BASE_URL}/responses`, {
       method: 'POST',
@@ -399,6 +455,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       await streamResponsesToChatCompletions(ociRes, res, req.body.model);
     } else {
       const result = await ociRes.json();
+
+      // TEMP DEBUG — remove once fixed
+      console.log('--- Raw OCI response ---');
+      console.log(JSON.stringify(result, null, 2));
+      console.log('------------------------');
+
       const chatCompletion = responsesResultToChatCompletion(result);
       res.json(chatCompletion);
     }
